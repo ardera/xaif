@@ -1,0 +1,1349 @@
+-- xaif, library for encoding and decoding UCG formatted images & easy image manipulation library
+local version = "1.2.8"
+function getVersion()
+	return version
+end
+
+-------------------------------------
+---------- UCG FILE FORMAT ----------
+-------------------------------------
+local encodeUCG, decodeUCG
+do
+	local formatVersion = 3
+	function getFormatVersion()
+		return formatVersion
+	end
+	
+	local function newBuffer(mode, source)
+		local bytes = {}
+		local bits = {}
+		
+		if type(source) == "table" then
+			local b
+			for a = 1, #source do
+				b = source[a]
+				if type(b) == "number" and b >= 0 and b < 256 then
+					bytes[#bytes +1] = math.floor(b)
+				else
+					bytes[#bytes +1] = 0
+				end
+			end
+		elseif type(source) == "string" then
+			for a = 1, #source do
+				bytes[#bytes +1] = source:sub(a, a):byte()
+			end
+		end
+		
+		local bitcache = {}
+		local pointer = 1
+		local bitcounter = 0
+		
+		local buf = {}
+		if mode == "w" then
+			bitcache = 0
+			buf.vcfaces = {}
+			
+			local function writeByteRaw(b)
+				bytes[pointer] = b
+				pointer = pointer +1
+			end
+			
+			local function flushBitcacheReal()
+				local rest = bitcounter % 8
+				local low, x
+				for a = bitcounter, 8, -8 do
+					low = 2^(a-8)
+					bitcache = bitcache % 2^a
+					x = (bitcache - (bitcache % low)) / low
+					writeByteRaw(x)
+				end
+				bitcache = bitcache % 2^rest
+				bitcounter = rest
+			end
+		
+			local function flushBitcache()
+				if bitcounter >= 8 then
+					flushBitcacheReal()
+				end
+			end
+			
+			local function writeBit(b)
+				bitcache = bitcache *2
+				if b == 1 or b == true then
+					bitcache = bitcache +1 
+				end
+				bitcounter = bitcounter +1
+				
+				if bitcounter >= 8 then
+					flushBitcacheReal()
+				end
+			end
+			buf.writeBit = writeBit
+			
+			local function writeByte(b)
+				if bitcounter == 0 then
+					writeByteRaw(b)
+					return
+				end
+				
+				bitcache = (bitcache * 256) + b
+				bitcounter = bitcounter + 8
+				
+				if bitcounter >= 8 then
+					flushBitcacheReal()
+				end
+			end
+			buf.writeByte = writeByte
+			
+			local function writeNumber(nbits, n)
+				if nbits == 1 then
+					writeBit(n)
+				end
+				
+				bitcache = (bitcache * 2^nbits) + n
+				bitcounter = bitcounter + nbits
+				
+				if bitcounter >= 8 then
+					flushBitcacheReal()
+				end
+			end
+			buf.writeNumber = writeNumber
+			
+			function buf.writeBytes(bs)
+				for a = 1, #bs do
+					writeByte(bs[a])
+				end
+			end
+			
+			function buf.writeBits(bits)
+				for a = 1, #bits do
+					writeBit(bits[a])
+				end
+			end
+			
+			function buf.writeChar(c)
+				writeByte(c:byte())
+			end
+			
+			function buf.writeWord(b)
+				if bitcounter == 0 then
+					writeByteRaw((b-(b%256))/256)
+					writeByteRaw(b%256)
+					return
+				end
+				
+				bitcache = (bitcache * 2^16) + b
+				bitcounter = bitcounter + 16
+				
+				flushBitcacheReal()
+			end
+			
+			function buf.writeInteger(b)
+				if bitcounter == 0 then
+					local h1, h2, h3 = 2^24, 2^16, 2^8
+					writeByteRaw((b-(b%h1))/h1)
+					writeByteRaw(((b%h1)-(b%h2))/h2)
+					writeByteRaw(((b%h2)-(b%h3))/h3)
+					writeByteRaw(b%h3)
+					return
+				end
+				
+				bitcache = (bitcache * 2^32) + b
+				bitcounter = bitcounter + 32
+				
+				flushBitcacheReal()
+			end
+			
+			function buf.finishByte(b)
+				local rest = 8 - (bitcounter % 8)
+				if rest == 8 then
+					rest = 0
+				end
+				bitcache = bitcache * 2^rest
+				bitcounter = bitcounter + rest
+				flushBitcacheReal()
+			end
+			
+			function buf.getBytes()
+				return bytes
+			end
+			
+			function buf.writeToFile(path)
+				local w = fs.open(path, "wb")
+				for a = 1, #bytes do
+					w.write(bytes[a])
+				end
+				w.close()
+			end
+			
+			function buf.writeToBuffer(b)
+				if b.writeBytes and b.writeBits then
+					b.writeBytes(bytes)
+					b.writeBits(bitcache)
+				end
+			end
+			
+			function buf.readFromFile(path)
+				local r = fs.open(path, "rb")
+				local b = r.read()
+				while b do
+					buf.writeByte(b)
+					b = r.read()
+				end
+				r.close()
+			end
+			
+			function buf.readFromBuffer(r)
+				if r.readByte and r.readBit then
+					local b = r.readByte()
+					while b do
+						buf.writeByte(b)
+						b = r.readByte()
+					end
+					b = r.readBit()
+					while b do
+						buf.writeBit(b)
+						b = r.readBit()
+					end
+				end
+			end
+			
+			function buf.getSize()
+				return #bytes
+			end
+			
+			local ternaryCache = {} -- contains the decimal value for each ternary code
+			local ternaryToHuff = {}
+			local function writeTernary(t)
+				local v = ternaryCache[t]
+				bitcache = bitcache * 2^v.l + v.v
+				bitcounter = bitcounter + v.l
+				
+				if bitcounter >= 8 then
+					flushBitcacheReal()
+				end
+			end
+			buf.writeTernary = writeTernary
+			
+			function buf.newVariableCodeInterface()
+				local f = {}
+				
+				local vcodeToTernary = {}
+				local valueToTernary = {}
+				
+				function f.loadCodes(t)
+					local n, n2, len
+					for a, b in pairs(t) do
+						n, n2, len = 0, 0, #b
+						for c = 1, len do
+							if b[c] == 1 then
+								n = n + (3^(c-1))
+								n2 = n2 + (2^(len-c))
+							end
+						end
+						n = n + ((3^len)-1)/2
+						ternaryCache[n] = {l=len, v=n2}
+						
+						vcodeToTernary[b] = n
+						valueToTernary[a] = n
+					end
+					
+					return valueToTernary, vcodeToTernary
+				end
+				
+				function f.loadCode(value, code)
+					n, n2, len = 0, 0, #code
+					for a = 1, len do
+						if code[a] == 1 then
+							n = n + (3^(a-1))
+							n2 = n2 + (2^(len-c))
+						end
+					end
+					n = n + ((3^len)-1)/2
+					ternaryCache[n] = {l=len, v=n2}
+					
+					vcodeToTernary[code] = n
+					valueToTernary[value] = n
+					
+					return valueToTernary, vcodeToTernary
+				end
+				
+				function f.getConversion_valueToTernary()
+					return valueToTernary
+				end
+				
+				function f.getConversion_vcodeToTernary()
+					return vcodeToTernary
+				end
+				
+				f.writeTernary = writeTernary
+				
+				function f.writeValue(a)
+					local v = valueToTernary[a]
+					if v then
+						local x = ternaryCache[v]
+						local cacheBefore = bitcache
+						local counterBefore = bitcounter
+						bitcache = bitcache * 2^x.l + x.v
+						bitcounter = bitcounter + x.l
+						if bitcounter >= 8 then
+							flushBitcacheReal()
+						end
+					else
+						error("valueToTernary: Ternary value not found! Key: "..tostring(a), 2)
+					end
+				end
+				
+				function f.writeVCode(v)
+					local val = vcodeToTernary[v]
+					if val then
+						local v2 = ternaryCache[val]
+						bitcache = bitcache * 2^v2.l + v2.v
+						bitcounter = bitcounter + v2.l
+						
+						if bitcounter >= 8 then
+							flushBitcacheReal()
+						end
+					else
+						error("vcodeToTernary: Ternary value not found! Key: "..tostring(v), 2)
+					end
+				end
+				
+				local _ = setmetatable({}, {__index = f, __newindex = function() end, metatable = "protected"})
+				local id = #buf.vcfaces +1
+				f.id = id
+				buf.vcfaces[id] = _
+				return _, id
+			end
+		elseif mode == "r" then
+			local function readByteRaw()
+				local b = bytes[pointer]
+				pointer = pointer +1
+				return b
+			end
+			
+			local function readBit()
+				if bitcache[1] == nil or bitpointer > 8 then
+					local by = readByteRaw()
+					if by then
+						bitcache = {
+							by >= 128,
+							(by % 128) >= 64,
+							(by % 64) >= 32,
+							(by % 32) >= 16,
+							(by % 16) >= 8,
+							(by % 8) >= 4,
+							(by % 4) >= 2,
+							(by % 2) >= 1
+						}
+					else
+						bitcache = {}
+					end
+					bitpointer = 1
+				end
+				
+				local b = bitcache[bitpointer]
+				bitpointer = bitpointer +1
+				if b == false then
+					return 0
+				elseif b == true then
+					return 1
+				end
+				return b
+			end
+			buf.readBit = readBit
+			
+			local function readByte()
+				if bitpointer == 1 then
+					return readByteRaw()
+				else
+					return readBit()*128 + readBit()*64 + readBit()*32 + readBit()*16 + readBit()*8 + readBit()*4 + readBit()*2 + readBit()
+				end
+			end
+			buf.readByte = readByte
+			
+			function buf.readBits(nbits)
+				local t = {}
+				for a = 1, nbits do
+					t[a] = readBit()
+				end
+				return t
+			end
+			
+			function buf.readNumber(nbits)
+				if nbits <= 0 then
+					return
+				elseif nbits == 1 then
+					return readBit()
+				else
+					local n=0
+					for a=nbits-1, 0, -1 do
+						local bit = readBit()
+						if bit then
+							n=n+ bit*2^a
+						else
+							return nil
+						end
+					end
+					return n
+				end
+			end
+			function buf.readWord()
+				return readByte() * 256 + readByte()
+			end
+			function buf.readInteger()
+				return readByte()*2^24 + readByte()*2^16 + readByte()*256 + readByte()
+			end
+			
+		else
+			error("invalid buffer mode: "..tostring(mode), 2)
+		end
+		
+		function buf.getPointer()
+			return pointer
+		end
+		function buf.getBitPointer()
+			return bitcounter or bitpointer
+		end
+		function buf.getType()
+			return mode
+		end
+		
+		return setmetatable({}, {__index=buf, __newindex=function() end, metatable="protected"})
+	end
+
+	function encodeUCG(tImage, w, h)
+		-- first, count colors
+		local colorCounter={}				-- stores the amount of pixels per color (index = color code; value = pixels using it)
+		local lengthsCounter={}				-- counts the uses of different lengths
+		
+		local numPixels=0					-- number of colored pixels
+		local numColors=0					-- number of used colors
+		local numLengths=0					-- numbers of used lengths
+		
+		local simpleColorCodes={}			-- the used huffman tree if numColors is less or equal 1
+		local simpleLengthCodes={}
+		
+		local lengthImage={}
+		
+		if not w then
+			w = 0
+			for a = 1, #tImage do
+				w = math.max(w, #tImage[a])
+			end
+		end
+		if not h then
+			h = #tImage
+		end
+		
+		local color, colorBefore, length, imageLine, lengthImageLine
+		for y=1, #tImage do
+			imageLine = tImage[y]
+			
+			lengthImage[y] = {}
+			lengthImageLine = lengthImage[y]
+			
+			colorBefore, length = nil, nil
+			for x=1, w do
+				color = imageLine[x] or 0
+				
+				if length == nil then
+					colorBefore = color
+					length = 0
+				end
+				
+				if color == colorBefore then
+					length = length +1
+				else
+					if not lengthsCounter[length] then
+						if numLengths < 2 then
+							simpleLengthCodes[length]={numLengths}
+						end
+						numLengths = numLengths +1
+					end
+					lengthImageLine[#lengthImageLine+1]={c=colorBefore, l=length}
+					lengthsCounter[length] = (lengthsCounter[length] or 0) +1
+					
+					if not colorCounter[colorBefore] then
+						if numColors < 2 then
+							simpleColorCodes[colorBefore] = {numColors}
+						end
+						numColors = numColors +1
+					end
+					colorCounter[colorBefore] = (colorCounter[colorBefore] or 0) +1
+					
+					length = 1
+					colorBefore = color
+				end
+				numPixels = numPixels +1
+			end
+			
+			if not lengthsCounter[length] then
+				if numLengths < 2 then
+					simpleLengthCodes[length] = {numLengths}
+				end
+				numLengths = numLengths +1
+			end
+			lengthImageLine[#lengthImageLine+1]={c=colorBefore, l=length}
+			lengthsCounter[length] = (lengthsCounter[length] or 0) +1
+			
+			if not colorCounter[colorBefore] then
+				if numColors < 2 then
+					simpleColorCodes[colorBefore] = {numColors}
+				end
+				numColors = numColors +1
+			end
+			colorCounter[colorBefore] = (colorCounter[colorBefore] or 0) +1
+		end
+		
+		if w > 65535 or h > 65535 then
+			return nil, "image too large"
+		end
+		
+		local buffer = newBuffer("w")
+		local writeByte, writeChar, writeBit, writeBits, writeNumber, finishByte, writeWord, writeInteger = 
+			buffer.writeByte, buffer.writeChar, buffer.writeBit, buffer.writeBits, buffer.writeNumber, buffer.finishByte, buffer.writeWord, buffer.writeInteger
+		
+		local function serCode(c, c2)
+			local s = ""
+			local c3 = c
+			if c2 then
+				c3 = {unpack(c)}
+				c3[#c3 +1] = c2
+			end
+			for a = 1, #c3 do
+				s = s..c3[a]
+			end
+			return s
+		end
+		
+		local function generateHuffmanTree(c)
+			local codes, low1p, low1v, low2p, low2v, lastkey = {}
+				-- the huffman codes,
+				-- the lowest probability of a color/node, the value of the color/node,
+				-- the 2nd lowest probability of a color/node, the value of the color/node
+			
+			local numentries
+			while true do
+				low1p = nil
+				low1v = -1
+				low2p = nil
+				low2v = -1
+				
+				numentries = 0
+				for a, b in pairs(c) do
+					if b then
+						if (low1p == nil) or (b < low1p) then
+							if (low2p == nil) or (low1p < low2p) then
+								low2p = low1p
+								low2v = low1v
+							end
+							low1p = b
+							low1v = a
+						elseif (low2p == nil) or (b < low2p) then
+							low2p = b
+							low2v = a
+						end
+						numentries = numentries +1
+					end
+				end
+				
+				c[low1v] = nil
+				c[low2v] = nil
+				lastkey = {[0]=low2v, [1]=low1v}
+				c[lastkey] = low1p+low2p
+				
+				if numentries <= 2 then
+					break
+				end
+			end
+			
+			local touch;
+			function touch(t, huffcode)
+				if type(t) == "number" then
+					codes[t] = {unpack(huffcode)}
+					return
+				else
+					huffcode[#huffcode +1] = 0
+					touch(t[0], huffcode)
+					huffcode[#huffcode] = 1
+					touch(t[1], huffcode)
+					huffcode[#huffcode] = nil
+				end
+			end
+			touch(lastkey, {})
+			
+			return codes, lastkey
+		end
+		
+		local function writeHufftree(tree, writeValue)
+			local towrite = {tree}
+			if not tree[1] then
+				writeBit(1)
+				writeValue(tree[0])
+				return
+			else
+				writeBit(0)
+			end
+			local towrite2, sub0, sub1
+			while #towrite ~= 0 do
+				towrite2 = {}
+				for a = 1, #towrite do
+					sub0, sub1 = towrite[a][0], towrite[a][1]
+					if type(sub0) == "number" then
+						writeBit(1)
+						writeValue(sub0)
+					else
+						writeBit(0)
+						towrite2[#towrite2 +1] = sub0
+					end
+					if type(sub1) == "number" then
+						writeBit(1)
+						writeValue(sub1)
+					else
+						writeBit(0)
+						towrite2[#towrite2 +1] = sub1
+					end
+				end
+				towrite=towrite2
+			end
+		end
+		
+		local function writePalette(hufftree)
+			writeHufftree(hufftree, function(v)
+				if v == 0 then
+					writeNumber(5, 16)
+				else
+					writeNumber(5, math.log(v)/math.log(2))
+				end
+			end)
+		end
+		
+		local function writeLengthTree(hufftree)
+			writeHufftree(hufftree, function(v)
+				if v <= 12 then
+					writeNumber(4, v)
+				else
+					local nbits = math.floor(math.log(v)/math.log(2)) +1
+					if nbits <= 5 then
+						writeNumber(4, 13)
+						writeNumber(5, v)
+					elseif nbits <= 8 then
+						writeNumber(4, 14)
+						writeNumber(8, v)
+					else
+						writeNumber(4, 15)
+						writeNumber(16, v)
+					end
+				end
+			end)
+		end
+		
+		-- Header: 0xFF2137
+		-- U is the 21st letter in the alphabet
+		-- C is the 3rd letter in the alphabet
+		-- G is the 7th letter in the alphabet
+		writeByte(0xFF)
+		writeByte(0x21)
+		writeByte(0x37)
+		writeByte(formatVersion)
+		
+		-- flags currently unused
+		flags = {0, 0, 0, 0,    0, 0, 0, 0}
+		writeBits(flags)
+		writeWord(w)
+		writeWord(h)
+		
+		local monocolor = numColors == 1
+		local colorcodes, colortree
+		if numColors <= 2 then
+			-- less or equal 2 colors, huffman tree algorithm would fail
+			colorcodes = simpleColorCodes
+			colortree = {}
+			for a, b in pairs(simpleColorCodes) do
+				colortree[b[1]] = a
+			end
+		else
+			-- generate color huffman tree
+			colorcodes, colortree = generateHuffmanTree(colorCounter)
+		end
+		writePalette(colortree)
+		
+		local monolength = numLengths == 1
+		local lengthcodes, lengthtree
+		if numLengths <= 2 then
+			-- less or equal 2 lengths, huffman tree algorithm would fail
+			lengthcodes = simpleLengthCodes
+			lengthtree = {}
+			for a, b in pairs(simpleLengthCodes) do
+				lengthtree[b[1]] = a
+			end
+		else
+			-- generate length huffman tree
+			lengthcodes, lengthtree = generateHuffmanTree(lengthsCounter)
+		end
+		writeLengthTree(lengthtree)
+		
+		local cFace, cWrite
+		if not monocolor then
+			cFace = buffer.newVariableCodeInterface()
+			cFace.loadCodes(colorcodes)
+			cWrite = cFace.writeValue
+		end
+		
+		local lFace, lWrite
+		if not monolength then
+			lFace = buffer.newVariableCodeInterface()
+			lFace.loadCodes(lengthcodes)
+			lWrite = lFace.writeValue
+		end
+		
+		-- write image data
+		for y = 1, h do
+			local line = lengthImage[y]
+			local dx = 0
+			for x = 1, #line do
+				local p = line[x]
+				if not monocolor then
+					cWrite(p.c)
+				end
+				if not monolength then
+					lWrite(p.l)
+				end
+				dx = dx + p.l
+			end
+		end
+		
+		finishByte(0)
+		
+		return buffer.getBytes()
+	end
+
+	function decodeUCG(bytes)
+		local buffer = newBuffer("r", bytes)
+		local readNumber, readWord, readBits, readBit, readByte = buffer.readNumber, buffer.readWord, buffer.readBits, buffer.readBit, buffer.readByte
+		
+		local sign = 0xFF2137
+		if readNumber(24) ~= sign then
+			return nil, false, "invalid signature! "..tostring(n)
+		end
+		
+		local version = readByte()
+		
+		local tImage = {}
+		if version == 3 then
+			local flags, w, h = readBits(8), readWord(), readWord()
+			
+			local function serCode(c, c2)
+				local s = ""
+				local c3 = c
+				if c2 then
+					c3 = {unpack(c)}
+					c3[#c3 +1] = c2
+				end
+				for a = 1, #c3 do
+					s = s..c3[a]
+				end
+				return s
+			end
+			
+			local function readHuffmanTree(readValue)
+				local tricodes = {}
+				local toread = {0}
+				local toread2
+				local depth = 0
+				
+				if readBit() == 1 then
+					return readValue(), true
+				end
+				
+				local ternary, digitValue, c0, c1
+				while #toread > 0 do
+					toread2 = {}
+					digitValue = 3^depth
+					
+					for a = 1, #toread do
+						ternary = toread[a]
+						c0, c1 = ternary + digitValue, ternary + 2*digitValue
+						
+						if readBit() == 1 then
+							local v = readValue()
+							tricodes[c0] = v
+						else
+							toread2[#toread2 +1] = c0
+						end
+						
+						if readBit() == 1 then
+							local v = readValue()
+							tricodes[c1] = v
+						else
+							toread2[#toread2 +1] = c1
+						end
+					end
+					depth = depth +1
+					toread = toread2
+				end
+				
+				return tricodes
+			end
+			
+			local colorcodes, monocolor = readHuffmanTree(function()
+				local b = readNumber(5)
+				if b == 16 then
+					return 0
+				else
+					return 2^b
+				end
+			end)
+			
+			local lengthcodes, monolength = readHuffmanTree(function()
+				local b = readNumber(4)
+				if b <= 12 then
+					return b
+				elseif b == 13 then
+					return readNumber(5)
+				elseif b == 14 then
+					return readNumber(8)
+				elseif b == 15 then
+					return readNumber(16)
+				end
+			end)
+			
+			local debX, debY, debColor
+			
+			local function lexHuffcode(dictionary, nodedictionary)
+				local ternary = 0
+				local depth = 0
+				local v
+				while not v do
+					local bi = readBit()
+					ternary = ternary + (bi+1)*(3^depth)
+					depth = depth +1
+					v = dictionary[ternary]
+				end
+				return v
+			end
+			
+			for y = 1, h do
+				tImage[y] = {}
+				local x = 0
+				while x < w do
+					debX, debY = x, y
+					local color
+					if monocolor then
+						color = colorcodes
+					else
+						color = lexHuffcode(colorcodes, colornodecodes)
+						debColor = color
+					end
+					local len
+					if monolength then
+						len = lengthcodes
+					else
+						len = lexHuffcode(lengthcodes, lengthnodecodes)
+						debX, debY, debColor = nil, nil, nil
+					end
+					for a = 1, len do
+						tImage[y][#tImage[y]+1] = color
+					end
+					x = x + len
+				end
+			end
+			return tImage, true
+		else
+			return nil, false, "unsupported version: "..(tostring(version) or "unknown")
+		end
+	end
+end
+
+-------------------------------
+---------- IMAGE API ----------
+-------------------------------
+do
+	local function getSubnodedFunction(subnodes, func)
+		return setmetatable({}, {__call = function(t, ...) return func(...) end, 
+			__index = subnodes,
+			__newindex = function() end,
+			metatable = "protected"
+		})
+	end
+	
+	local baseLayer = {}
+	local fileReaders = {}
+	local fileWriters = {}
+	local barrayReaders = {}
+	local barrayCheckers = {}
+	local barrayWriters = {}
+	local shaders = {}
+	
+	local function getNearestColor(r, g, b)
+		
+	end
+	
+	local function readBytes(path, errlvl)
+		if type(path) ~= "string" then
+			error("Argument #1: string expected", errlvl or 2)
+		elseif not fs.exists(path) or fs.isDir(path) then
+			error("Could not read from path "..path, errlvl or 2)
+		end
+		
+		local barray, b = {}
+		
+		local r = fs.open(path, "rb")
+		b = r.read()
+		while b do
+			barray[#barray +1] = b
+			b = r.read()
+		end
+		r.close()
+		return barray
+	end
+
+	
+	local putilsConversion = {}
+	local invPutilsConversion = {}
+	do
+		for a = 1, 16 do
+			local char = ("0123456789abcdef"):sub(a, a)
+			putilsConversion[char:byte()] = 2^(a-1)
+			putilsConversion[char:upper():byte()] = 2^(a-1)
+			invPutilsConversion[2^(a-1)] = char:byte()
+		end
+		putilsConversion[(" "):byte()] = 0
+		invPutilsConversion[0] = (" "):byte()
+	end
+	local function decodePUtils(barray)
+		local lastNewlineChar = false
+		local tImage = {{}}
+		local line = tImage[1]
+		local lineNr = 1
+		
+		local w = 0
+		local chars = 0
+		for a = 1, #barray do
+			local x = barray[a]
+			local n = putilsConversion[x]
+			if n then
+				line[#line +1] = n
+				lastNewlineChar = false
+				chars = chars +1
+			elseif x == 0x0D or x == 0x0A then
+				if lastNewlineChar then
+					lastNewlineChar = false
+				else
+					lineNr = lineNr +1
+					tImage[lineNr] = {}
+					line = tImage[lineNr]
+					w = math.max(w, chars)
+					chars = 0
+					lastNewlineChar = true
+				end
+			else
+				return nil, "barray broken"
+			end
+		end
+		w = math.max(w, chars)
+		return tImage, w, lineNr
+	end
+	local function encodePUtils(tImage)
+		local barray = {}
+		for y = 1, #tImage do
+			local line = tImage[y]
+			for x = 1, #line do
+				local c = invPutilsConversion[line[x]]
+				if not c then
+					return nil, "broken image"
+				end
+				barray[#barray +1] = c
+			end
+			if y ~= #tImage then
+				barray[#barray +1] = 0x0D
+				barray[#barray +1] = 0x0A
+			end
+		end
+		return barray
+	end
+	
+	local function newImage(w, h, tImage, cache)
+		cache = cache or {}
+		local instance = {}
+		local this = {}
+		-- manipulation
+		instance.getSize = function()
+			return w, h
+		end
+		instance.getWidth = function()
+			return w
+		end
+		instance.getHeight = function()
+			return h
+		end
+		instance.getPixel = function(x, y)
+			x = math.floor(x)
+			y = math.floor(y)
+			if x > 0 and x <= w and y > 0 and y <= h then
+				return tImage[y][x] or 0
+			end
+			error("coordinates out of bounds", 2)
+		end
+		instance.setPixel = function(x, y, v)
+			x = math.floor(x)
+			y = math.floor(y)
+			if type(v) ~= "number" then
+				error("Argument #3: expected number", 2)
+			end
+			v = 2^(math.log(v) / math.log(2))
+			if x > 0 and x <= w and y > 0 and y <= h then
+				tImage[y][x] = v
+				return this
+			end
+			error("coordinates out of bounds", 2)
+		end
+		instance.crop = function(x1, y1, x2, y2)
+			if type(x1) ~= "number" then error("Argument #1: expected number", 2) end
+			if type(y1) ~= "number" then error("Argument #2: expected number", 2) end
+			if type(x2) ~= "number" then error("Argument #3: expected number", 2) end
+			if type(y2) ~= "number" then error("Argument #4: expected number", 2) end
+			
+			local function temp(n1, n2)
+				if n1 > n2 then
+					return n2, n1
+				else
+					return n1, n2
+				end
+			end
+			local fx, tx = temp(math.floor(x1), math.floor(x2))
+			local fy, ty = temp(math.floor(y1), math.floor(y2))
+			
+			if (fx < 1) or (fx > w) or (tx < 1) or (tx > w) or (fy < 1) or (fy > h) or (ty < 1) or (ty > h) then
+				error("coordinates out of bounds", 2)
+			end
+			
+			local newWidth = tx-fx +1
+			local newHeight= ty-fy +1
+			
+			local newimg = {}
+			for y = fy, ty do
+				newimg[#newimg +1] = {unpack(tImage[y], fx, tx)}
+			end
+			
+			tImage = newimg
+			w, h = newWidth, newHeight
+			cache = {}
+			return this
+		end
+		
+		local applyShaderCache = {}
+		local applyShader = function(shader, ...)
+			for y = 1, h do
+				local line = tImage[y]
+				for x = 1, w do
+					line[x] = shader(x, y, line[x], ...) or line[x]
+				end
+			end
+			return this
+		end
+		instance.applyShader = setmetatable({}, {
+			__call = function(t, shader, ...)
+				if type(shader) == "function" then
+					return applyShader(shader, ...)
+				else
+					error("Argument #1: expected function", 2)
+				end
+			end, 
+			__index = function(t, k)
+				if applyShaderCache[k] then
+					return applyShaderCache[k]
+				elseif shaders[k] then
+					local v = function(...)
+						return applyShader(shaders[k], ...)
+					end
+					applyShaderCache[k] = v
+					return v
+				end
+			end,
+			__newindex = function() end,
+			metatable = "protected"
+		})
+		
+		instance.writeFile = setmetatable({}, {
+			__index = function(t, k)
+				if fileWriters[k] then
+					return function(path)
+						if not fs.isDir(path) and not fs.isReadOnly(path) then
+							fileWriters[k](path, tImage) 
+						else
+							error("can't write at this location", 2)
+						end
+						return this 
+					end
+				end
+			end, __newindex = function() end, metatable = "protected"
+		})	
+		instance.getBArray = setmetatable({}, {
+			__index = function(t, k)
+				if barrayWriters[k] then
+					return function()
+						if not cache[k] then
+							cache[k] = barrayWriters[k](tImage)
+						end
+						return cache[k]
+					end
+				end
+			end,
+			__newindex = function() end, metatable = "protected"
+		})
+		instance.getRawImage = function()
+			return tImage
+		end
+		
+		instance.draw = function(offsetX, offsetY)
+			if type(offsetX) ~= "number" then error("Argument #1: expected number", 2) end
+			if type(offsetY) ~= "number" then error("Argument #2: expected number", 2) end
+			
+			for y=1,#tImage do
+				local line = tImage[y]
+				for x=1, #line do
+					local e = line[x]
+					if e > 0 then
+						term.setBackgroundColor(e)
+						term.setCursorPos(offsetX +x -1, offsetY +y -1)
+						term.write(" ")
+					end
+				end
+			end
+			
+			return this
+		end
+		
+		this = setmetatable({}, {__index = function(t, k)
+			return instance[k] or tImage[k]
+		end, __newindex = function() end, metatable = "protected"})
+		return this
+	end
+	
+	readFile = getSubnodedFunction(fileReaders, function(path)
+		barray = readBytes(path, 4)
+		
+		local n
+		for a, b in pairs(barrayCheckers) do
+			if b(barray) then
+				n = a
+				break
+			end
+		end
+		n = n or "putils"
+		
+		local tImage, w, h, doCache = barrayReaders[n](barray)
+		if not tImage then
+			return nil, "unknown fileformat"
+		end
+		
+		if doCache == false then
+			return newImage(w, h, tImage)
+		end
+		return newImage(w, h, tImage, {[n] = barray})
+	end)
+	readBArray = getSubnodedFunction(barrayReaders, function(barray)
+		local n
+		for a, b in pairs(barrayCheckers) do
+			if b(barray) then
+				n = a
+				break
+			end
+		end
+		n = n or "putils"
+		
+		local tImage, w, h, doCache = barrayReaders[n](barray)
+		if not tImage then
+			return nil, "unknown fileformat"
+		end
+		
+		if doCache == false then
+			return newImage(w, h, tImage)
+		end
+		return newImage(w, h, tImage, {[n] = barray})
+	end)
+	readRawImage = function(rimg)
+		if type(rimg) ~= "table" then
+			error("Argument #1: expected table", 2)
+		end
+		
+		local w, h = 0, #rimg
+		for a = 1, #rimg do
+			w = math.max(w, #rimg[a])
+		end
+		return newImage(w, h, rimg)
+	end
+	new = function(w, h, base)
+		if type(w) ~= "number" then
+			error("Argument #1: expected number", 2)
+		elseif type(h) ~= "number" then
+			error("Argument #2: expected number", 2)
+		end
+		
+		local tImage = {}
+		local tb = type(base)
+		local c = nil
+		local shader
+		if tb == "function" then
+			-- base is a shader
+			c = colors.white
+			shader = base
+		elseif tb == "number" or tb == "nil" then
+			-- base is a color
+			c = base or colors.white
+		end
+		
+		if not c then
+			error("Argument #3: expected nil/number/function", 2)
+		end
+		
+		local line = {}
+		for a = 1, w do
+			line[a] = c
+		end
+		for a = 1, h do
+			tImage[a] = {unpack(line)}
+		end
+		local img = newImage(w, h, tImage)
+		if shader then
+			img.applyShader(shader)
+		end
+		return img
+	end
+	addFileFormat = function(name, readBArray, getBArray, checkBArray)
+		if fileReaders[name] then
+			error("fileformat already registered", 2)
+		end
+		fileReaders[name] = function(path)
+			barray = readBytes(path, 3)
+			
+			local tImage, w, h, doCache = barrayReaders[name](barray)
+			if not tImage then
+				return nil, "file is broken"
+			end
+			
+			if doCache == false then
+				return newImage(w, h, tImage)
+			end
+			return newImage(w, h, tImage, {[name] = tImage})
+		end
+		fileWriters[name] = function(path, tImage)
+			barray = getBArray(tImage)
+			
+			local w = fs.open(path, "wb")
+			for n = 1, #barray do
+				w.write(barray[n])
+			end
+			w.close()
+		end
+		
+		barrayReaders[name] = readBArray
+		barrayCheckers[name] = checkBArray
+		barrayWriters[name] = getBArray
+	end
+	addShader = function(name, shader)
+		if shaders[name] then
+			error("shader already registered", 2)
+		end
+		shaders[name] = shader
+	end
+	
+	
+	addFileFormat("ucg", decodeUCG, encodeUCG, function(b) return b[1] == 0xFF and b[2] == 0x21 and b[3] == 0x37 end)
+	addFileFormat("putils", decodePUtils, encodePUtils)
+	
+	addShader("negate", function(x, y, v)
+		
+	end)
+	addShader("invert", function(x, y, v)
+		
+	end)
+	addShader("monochrome", function(x, y, v)
+	
+	end)
+	
+	addShader("contrast", function(x, y, v, arg)
+		local function sign(x)
+			if x == 0 then
+				return 0
+			elseif x < 0 then
+				return -1
+			else
+				return 1
+			end
+		end
+		
+		local z = math.log(v)/math.log(2)
+		local a = math.abs(arg)/100
+		if arg == 0 then
+			return v
+		elseif arg < 0 then
+			r = z -math.min((sign(z-8)*math.floor(a*8)), math.abs(8-z))
+		elseif arg > 0 then
+			r = math.max(0, math.min(15, z +(sign(z-8)*math.floor(a*8))))
+		end
+		return 2^r
+	end)
+end
+
+
+-- examples
+--[[
+	------- CREATING AN IMAGE OBJECT
+	-- loading a paintutils image file:
+	local img = xaif.readFile.putils("path/to/file")
+	
+	-- loading an ucg image file:
+	local img = xaif.readFile.ucg("path/to/file")
+	
+	-- load any image file (the loader automatically detects the type)
+	local img = xaif.readFile("path/to/file")
+	
+	-- load a image table (the ones being used by the paintutils API)
+	local img = xaif.readRawImage(paintutils.loadImage("imgOne"))
+	
+	
+	
+	------- STORING OR CONVERTING AN IMAGE OBJECT
+	-- storing an image as an UCG file:
+	img.writeFile.ucg("path/to/file")
+	
+	-- or as a paintutils image file:
+	img.writeFile.putils("path/to/file")
+	
+	-- getting an image table that is drawable by the paintutils API:
+	img.getRawImage()
+	
+	
+	
+	------- USING OR MANIPULATING IT
+	-- drawing it directly:
+	img.draw(x, y)
+	
+	-- cropping it: (fromX, fromY, toX, toY)
+	img.crop(5, 5, 20, 20)
+	
+	
+	
+	------- SHADERS
+	-- applying a shader:
+	img.applyShader(function(x, y, colorValue)
+		return 2^( (x + math.log(colorValue)/math.log(2)) % 16 ) -- returns the new color for the pixel (x|y)
+	end)
+	
+	-- adding a shader for later use:
+	xaif.addShader("shiftColorByValue", function(x, y, colorValue, arg1)
+		return 2^((math.log(colorValue)/math.log(2) + arg1) % 16)
+	end)
+	
+	-- using a shader previously registered:
+	img.applyShader.shiftColorByValue(8) --(runs the shader registered in the above example, with arg1 being equal to 8)
+	
+	
+	
+	------- CHAINING API CALLS
+	-- this is possible:
+	xaif.readFile.ucg("img5.ucg").crop(5, 5, 20, 20).applyShader.shiftColorByValue(8).draw(1, 1).writeFile.ucg("img6.ucg")
+]]
