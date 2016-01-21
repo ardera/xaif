@@ -1,5 +1,5 @@
 -- xaif, library for encoding and decoding UCG formatted images & easy image manipulation library
-local version = "1.2.8"
+local version = "1.2.9"
 function getVersion()
 	return version
 end
@@ -9,7 +9,7 @@ end
 -------------------------------------
 local encodeUCG, decodeUCG
 do
-	local formatVersion = 3
+	local formatVersion = 1
 	function getFormatVersion()
 		return formatVersion
 	end
@@ -731,7 +731,7 @@ do
 		local version = readByte()
 		
 		local tImage = {}
-		if version == 3 then
+		if version == 1 then
 			local flags, w, h = readBits(8), readWord(), readWord()
 			
 			local function serCode(c, c2)
